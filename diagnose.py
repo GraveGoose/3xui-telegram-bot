@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diagnostic script for 3x-ui panel connectivity.
+Diagnostic script - tries multiple login methods and shows raw responses.
 Run: python diagnose.py
 """
 import asyncio
@@ -11,79 +11,82 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-PANEL_URL = os.getenv("PANEL_URL", "").rstrip("/")
-PANEL_USERNAME = os.getenv("PANEL_USERNAME", "")
-PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "")
+URL = os.getenv("PANEL_URL", "").rstrip("/")
+USER = os.getenv("PANEL_USERNAME", "")
+PASS = os.getenv("PANEL_PASSWORD", "")
+
+
+async def try_login(session, method_name, **kwargs):
+    url = URL + "/login"
+    print(f"\n  [{method_name}] POST {url}")
+    try:
+        async with session.post(url, timeout=aiohttp.ClientTimeout(total=10), **kwargs) as resp:
+            raw = await resp.text()
+            print(f"  Status : {resp.status}")
+            print(f"  CT     : {resp.headers.get('Content-Type', '-')}")
+            print(f"  Body   : '{raw[:300]}'")
+            return resp.status == 200 and raw
+    except Exception as e:
+        print(f"  ERROR: {e}")
+        return False
 
 
 async def diagnose():
     print(f"\n{'='*60}")
-    print(f"Panel URL : {PANEL_URL}")
-    print(f"Username  : {PANEL_USERNAME}")
-    print(f"{'='*60}\n")
+    print(f"URL  : {URL}")
+    print(f"User : {USER}")
+    print(f"{'='*60}")
 
     jar = aiohttp.CookieJar(unsafe=True)
-    connector = aiohttp.TCPConnector(ssl=False)
-    headers = {
+    conn = aiohttp.TCPConnector(ssl=False)
+    hdrs = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Referer": PANEL_URL + "/",
-        "Origin": PANEL_URL,
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": URL,
+        "Referer": URL + "/",
     }
 
-    async with aiohttp.ClientSession(cookie_jar=jar, connector=connector, headers=headers) as session:
+    async with aiohttp.ClientSession(cookie_jar=jar, connector=conn, headers=hdrs) as session:
 
-        # Step 1: GET root -> get session cookie
-        print("[1] GET / (obtain session cookie)...")
-        try:
-            async with session.get(PANEL_URL + "/", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                print(f"    Status : {resp.status}")
-                cookies = {k: v.value[:40]+"..." for k, v in session.cookie_jar.filter_cookies(PANEL_URL).items()}
-                print(f"    Cookies: {cookies}")
-                await resp.read()
-        except Exception as e:
-            print(f"    ERROR: {e}")
-            return
+        print("\n[1] GET / to plant session cookie...")
+        async with session.get(URL + "/", timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            print(f"  Status : {resp.status}")
+            cookies = {k: v.value[:50] for k, v in jar.filter_cookies(URL).items()}
+            print(f"  Cookies: {cookies}")
+            await resp.read()
 
-        # Step 2: POST /login WITH the session cookie
-        print("\n[2] POST /login (with session cookie)...")
-        payload = f"username={PANEL_USERNAME}&password={PANEL_PASSWORD}"
-        try:
-            async with session.post(
-                PANEL_URL + "/login",
-                data=payload,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                print(f"    Status : {resp.status}")
-                print(f"    Content-Type: {resp.headers.get('Content-Type', '-')}")
-                body = await resp.text()
-                print(f"    Body   : {body[:400]}")
-                cookies = {k: v.value[:40]+"..." for k, v in session.cookie_jar.filter_cookies(PANEL_URL).items()}
-                print(f"    Cookies: {cookies}")
-        except Exception as e:
-            print(f"    ERROR: {e}")
-            return
+        print("\n[2] Login attempts:")
 
-        # Step 3: GET /xui/API/inbounds
-        print("\n[3] GET /xui/API/inbounds...")
-        try:
-            async with session.get(PANEL_URL + "/xui/API/inbounds", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                print(f"    Status : {resp.status}")
-                body = await resp.text()
-                try:
-                    parsed = json.loads(body)
-                    print(f"    Success: {parsed.get('success')}")
-                    objs = parsed.get('obj', [])
-                    print(f"    Inbounds: {len(objs)}")
-                    for ib in objs:
-                        print(f"      ID={ib.get('id')} {ib.get('remark','?')} [{ib.get('protocol','?')}] :{ib.get('port','?')}")
-                except Exception:
-                    print(f"    Body: {body[:300]}")
-        except Exception as e:
-            print(f"    ERROR: {e}")
+        # Method A: JSON
+        await try_login(session, "JSON",
+            json={"username": USER, "password": PASS},
+            headers={"Content-Type": "application/json"}
+        )
 
-    print(f"\n{'='*60}")
+        # Method B: form-urlencoded string
+        await try_login(session, "FORM-STR",
+            data=f"username={USER}&password={PASS}",
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+
+        # Method C: dict (aiohttp encodes as form)
+        await try_login(session, "FORM-DICT",
+            data={"username": USER, "password": PASS}
+        )
+
+        # Method D: no content-type override
+        await try_login(session, "BARE-JSON",
+            json={"username": USER, "password": PASS}
+        )
+
+        print(f"\n{'='*60}")
+        print("\n[3] Check curl command to run on the SERVER:")
+        print(f"""curl -k -v -c /tmp/cookie.txt -X GET '{URL}/' && \\
+curl -k -v -b /tmp/cookie.txt -X POST '{URL}/login' \\
+  -H 'Content-Type: application/json' \\
+  -d '{{"username":"{USER}","password":"{PASS}"}}'
+""")
 
 
 if __name__ == "__main__":

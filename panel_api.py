@@ -11,13 +11,8 @@ logger = logging.getLogger(__name__)
 class XUIPanel:
     """
     Async HTTP client for 3x-ui panel API.
-
-    Auth strategy for sub-path installs:
-      GET {base_url}  ->  200 + Set-Cookie: 3x-ui=...
-      Then POST {base_url}/login  with the cookie already set.
-
-    The cookie is obtained in the first GET, then login POST is sent
-    with that cookie — which is what the browser does.
+    Sub-path install support: PANEL_URL includes base path.
+    Auth: GET / -> cookie -> POST /login JSON
     """
 
     def __init__(self, base_url: str, username: str, password: str):
@@ -38,60 +33,104 @@ class XUIPanel:
                 cookie_jar=jar,
                 connector=connector,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120",
                     "Accept": "application/json, text/plain, */*",
-                    "Referer": self.base_url + "/",
-                    "Origin": self.base_url,
+                    "X-Requested-With": "XMLHttpRequest",
                 },
             )
         return self._session
 
     async def login(self) -> bool:
         """
-        Two-step auth:
-          1. GET base_url  -> receive session cookie (3x-ui=...)
-          2. POST /login   -> send credentials WITH that cookie
+        Auth flow:
+          1. GET /  -> receive session cookie
+          2. POST /login with JSON body {username, password}
         """
         session = await self._get_session()
         self._logged_in = False
 
-        # Step 1: GET root to obtain the initial session cookie
+        # Step 1: fetch root to plant the session cookie
         try:
             async with session.get(
                 self._url("/"),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 logger.info(f"[auth] GET / -> {resp.status}")
-                await resp.read()  # consume body
+                await resp.read()
         except Exception as e:
             logger.error(f"[auth] GET / failed: {e}")
             return False
 
-        # Step 2: POST /login with cookie already in jar
+        # Step 2: try JSON login first (newer 3x-ui versions)
+        ok = await self._login_json(session)
+        if ok:
+            return True
+
+        # Step 3: fallback to form-urlencoded
+        ok = await self._login_form(session)
+        return ok
+
+    async def _login_json(self, session: aiohttp.ClientSession) -> bool:
+        """POST /login with JSON body."""
+        url = self._url("/login")
+        body = {"username": self.username, "password": self.password}
+        try:
+            async with session.post(
+                url,
+                json=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Referer": self._url("/"),
+                    "Origin": self.base_url,
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                logger.info(f"[auth] POST /login JSON -> {resp.status}")
+                raw = await resp.text()
+                logger.info(f"[auth] body: {raw[:300]}")
+                if resp.status == 403:
+                    return False
+                result = json.loads(raw)
+                if result.get("success"):
+                    logger.info("[auth] JSON login OK")
+                    self._logged_in = True
+                    return True
+                logger.warning(f"[auth] JSON login fail: {result}")
+                return False
+        except Exception as e:
+            logger.warning(f"[auth] JSON login exception: {e}")
+            return False
+
+    async def _login_form(self, session: aiohttp.ClientSession) -> bool:
+        """POST /login with application/x-www-form-urlencoded."""
+        url = self._url("/login")
         payload = f"username={self.username}&password={self.password}"
         try:
             async with session.post(
-                self._url("/login"),
+                url,
                 data=payload,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": self._url("/"),
+                    "Origin": self.base_url,
+                },
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
-                logger.info(f"[auth] POST /login -> {resp.status}")
+                logger.info(f"[auth] POST /login FORM -> {resp.status}")
                 raw = await resp.text()
-                logger.info(f"[auth] login body: {raw[:300]}")
-                try:
-                    result = json.loads(raw)
-                except json.JSONDecodeError:
-                    logger.error(f"[auth] non-JSON: '{raw[:200]}'")
+                logger.info(f"[auth] body: {raw[:300]}")
+                if resp.status == 403:
+                    logger.error("[auth] 403 on form login too")
                     return False
+                result = json.loads(raw)
                 if result.get("success"):
-                    logger.info("[auth] login successful")
+                    logger.info("[auth] FORM login OK")
                     self._logged_in = True
                     return True
-                logger.error(f"[auth] login failed: {result}")
+                logger.error(f"[auth] FORM login fail: {result}")
                 return False
         except Exception as e:
-            logger.error(f"[auth] POST /login exception: {e}")
+            logger.error(f"[auth] FORM login exception: {e}")
             return False
 
     async def _request(
@@ -113,7 +152,7 @@ class XUIPanel:
             ) as resp:
                 logger.info(f"[api] {method} {path} -> {resp.status}")
                 if resp.status in (401, 403) and retry_login:
-                    logger.warning("[api] session expired, re-logging in...")
+                    logger.warning("[api] re-logging in...")
                     ok = await self.login()
                     if ok:
                         return await self._request(method, path, data, json_data, retry_login=False)
@@ -127,10 +166,6 @@ class XUIPanel:
         except Exception as e:
             logger.error(f"[api] error {method} {url}: {e}")
             return None
-
-    # ------------------------------------------------------------------ #
-    #  Inbounds
-    # ------------------------------------------------------------------ #
 
     async def get_inbounds(self) -> Optional[List[Dict]]:
         if not self._logged_in:
@@ -150,10 +185,6 @@ class XUIPanel:
         if result and result.get("success"):
             return result.get("obj")
         return None
-
-    # ------------------------------------------------------------------ #
-    #  Client builders
-    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _sub_id() -> str:
