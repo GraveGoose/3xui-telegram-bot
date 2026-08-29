@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Diagnostic script - tries multiple login methods and shows raw responses.
+Diagnostic: manually extracts Set-Cookie and injects it.
 Run: python diagnose.py
 """
 import asyncio
@@ -16,77 +16,84 @@ USER = os.getenv("PANEL_USERNAME", "")
 PASS = os.getenv("PANEL_PASSWORD", "")
 
 
-async def try_login(session, method_name, **kwargs):
-    url = URL + "/login"
-    print(f"\n  [{method_name}] POST {url}")
-    try:
-        async with session.post(url, timeout=aiohttp.ClientTimeout(total=10), **kwargs) as resp:
-            raw = await resp.text()
-            print(f"  Status : {resp.status}")
-            print(f"  CT     : {resp.headers.get('Content-Type', '-')}")
-            print(f"  Body   : '{raw[:300]}'")
-            return resp.status == 200 and raw
-    except Exception as e:
-        print(f"  ERROR: {e}")
-        return False
-
-
 async def diagnose():
     print(f"\n{'='*60}")
-    print(f"URL  : {URL}")
-    print(f"User : {USER}")
+    print(f"URL: {URL}  User: {USER}")
     print(f"{'='*60}")
 
-    jar = aiohttp.CookieJar(unsafe=True)
     conn = aiohttp.TCPConnector(ssl=False)
-    hdrs = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "X-Requested-With": "XMLHttpRequest",
-        "Origin": URL,
-        "Referer": URL + "/",
-    }
+    # DummyCookieJar - disable automatic cookie handling
+    async with aiohttp.ClientSession(
+        cookie_jar=aiohttp.DummyCookieJar(),
+        connector=conn,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+    ) as session:
 
-    async with aiohttp.ClientSession(cookie_jar=jar, connector=conn, headers=hdrs) as session:
-
-        print("\n[1] GET / to plant session cookie...")
+        # Step 1: GET root, read Set-Cookie manually
+        print("\n[1] GET / (manual cookie extraction)")
+        cookie_val = ""
         async with session.get(URL + "/", timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            print(f"  Status : {resp.status}")
-            cookies = {k: v.value[:50] for k, v in jar.filter_cookies(URL).items()}
-            print(f"  Cookies: {cookies}")
+            print(f"  Status     : {resp.status}")
+            raw_sc = resp.headers.get("Set-Cookie", "")
+            print(f"  Set-Cookie : {raw_sc[:120]}")
+            if raw_sc:
+                cookie_val = raw_sc.split(";")[0].strip()
+                print(f"  Extracted  : {cookie_val[:80]}")
+            else:
+                print("  WARNING: No Set-Cookie in response!")
             await resp.read()
 
-        print("\n[2] Login attempts:")
+        # Step 2: POST /login with manual Cookie header
+        print("\n[2] POST /login (injecting cookie manually)")
+        hdrs = {
+            "Content-Type": "application/json",
+            "Referer": URL + "/",
+            "Origin": URL,
+        }
+        if cookie_val:
+            hdrs["Cookie"] = cookie_val
+            print(f"  Sending Cookie: {cookie_val[:80]}")
+        else:
+            print("  No cookie to send!")
 
-        # Method A: JSON
-        await try_login(session, "JSON",
+        async with session.post(
+            URL + "/login",
             json={"username": USER, "password": PASS},
-            headers={"Content-Type": "application/json"}
-        )
+            headers=hdrs,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            print(f"  Status : {resp.status}")
+            print(f"  CT     : {resp.headers.get('Content-Type', '-')}")
+            raw = await resp.text()
+            print(f"  Body   : {raw[:400]}")
+            new_sc = resp.headers.get("Set-Cookie", "")
+            if new_sc:
+                cookie_val = new_sc.split(";")[0].strip()
+                print(f"  New cookie: {cookie_val[:80]}")
 
-        # Method B: form-urlencoded string
-        await try_login(session, "FORM-STR",
-            data=f"username={USER}&password={PASS}",
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
-        )
+        # Step 3: GET /xui/API/inbounds
+        if cookie_val:
+            print("\n[3] GET /xui/API/inbounds")
+            async with session.get(
+                URL + "/xui/API/inbounds",
+                headers={"Cookie": cookie_val},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                print(f"  Status : {resp.status}")
+                raw = await resp.text()
+                try:
+                    data = json.loads(raw)
+                    print(f"  Success: {data.get('success')}")
+                    for ib in data.get("obj", []):
+                        print(f"    ID={ib['id']} {ib.get('remark','?')} [{ib.get('protocol','?')}] :{ib.get('port','?')}")
+                except Exception:
+                    print(f"  Body: {raw[:300]}")
 
-        # Method C: dict (aiohttp encodes as form)
-        await try_login(session, "FORM-DICT",
-            data={"username": USER, "password": PASS}
-        )
-
-        # Method D: no content-type override
-        await try_login(session, "BARE-JSON",
-            json={"username": USER, "password": PASS}
-        )
-
-        print(f"\n{'='*60}")
-        print("\n[3] Check curl command to run on the SERVER:")
-        print(f"""curl -k -v -c /tmp/cookie.txt -X GET '{URL}/' && \\
-curl -k -v -b /tmp/cookie.txt -X POST '{URL}/login' \\
-  -H 'Content-Type: application/json' \\
-  -d '{{"username":"{USER}","password":"{PASS}"}}'
-""")
+    print(f"\n{'='*60}")
 
 
 if __name__ == "__main__":
